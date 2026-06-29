@@ -13,8 +13,8 @@ const INSTANCE_ID    = process.env.ZAPI_INSTANCE_ID;
 const INSTANCE_TOKEN = process.env.ZAPI_TOKEN;
 const ZAPI_BASE      = 'https://api.z-api.io/instances/' + INSTANCE_ID + '/token/' + INSTANCE_TOKEN;
 const ANTHROPIC_KEY  = process.env.ANTHROPIC_KEY;
-const NOME_GRUPO     = 'Compras de pecas p/ ecell';
-const SEU_NUMERO     = '5565992004200';
+const NOME_GRUPO     = process.env.NOME_GRUPO || 'Compras de pecas p/ ecell';
+const SEU_NUMERO     = process.env.SEU_NUMERO || '5565992004200';
 
 // ─── Controle de saudações do dia ────────────────────────────
 // Guarda quais fornecedores já receberam saudação hoje
@@ -35,6 +35,8 @@ const processados     = new Set();
 const pedidosAtivos   = {};
 const historicoPedidos = [];
 const MAX_HISTORICO   = 100;
+const ARQ_PEDIDOS_ATIVOS = path.join(__dirname, 'pedidos_ativos.json');
+const FOLLOWUP_MS     = 30 * 60 * 1000; // 30 minutos
 
 function salvarDados() {
   try {
@@ -73,6 +75,51 @@ function saudacaoAtual() {
 var dadosSalvos = carregarDados();
 historicoPedidos.push(...(dadosSalvos.historico || []));
 
+// ─── Persistência de pedidos ativos + follow-up ──────────────
+function salvarPedidosAtivos() {
+  try {
+    fs.writeFileSync(ARQ_PEDIDOS_ATIVOS, JSON.stringify(pedidosAtivos, null, 2));
+  } catch(e) {}
+}
+
+// Agenda o lembrete de follow-up para um pedido. atrasoMs opcional
+// (usado ao recarregar: agenda só o tempo restante).
+function agendarFollowup(chave, atrasoMs) {
+  if (atrasoMs == null) atrasoMs = FOLLOWUP_MS;
+  if (atrasoMs < 0) atrasoMs = 0;
+  setTimeout(async function() {
+    var pedido = pedidosAtivos[chave];
+    if (!pedido || pedido.resolvido || pedido.followupEnviado) return;
+    pedido.followupEnviado = true;
+    salvarPedidosAtivos();
+    try {
+      await enviarMensagem(pedido.fornecedorTelefone,
+        '⏰ Oi! Ainda aguardamos sobre *' + pedido.peca + ' ' + pedido.modelo + '*. Tem disponível? Responda 👍 ou ❌');
+      await enviarMensagem(SEU_NUMERO,
+        '⚠️ *' + pedido.fornecedor + '* não respondeu em 30min sobre *' + pedido.peca + ' ' + pedido.modelo + '*');
+    } catch(e) {}
+  }, atrasoMs);
+}
+
+// Recarrega pedidos ativos do disco e reagenda follow-ups pendentes
+function carregarPedidosAtivos() {
+  try {
+    if (!fs.existsSync(ARQ_PEDIDOS_ATIVOS)) return;
+    var salvos = JSON.parse(fs.readFileSync(ARQ_PEDIDOS_ATIVOS, 'utf-8'));
+    Object.assign(pedidosAtivos, salvos);
+    var agora = Date.now();
+    var reagendados = 0;
+    for (var chave in pedidosAtivos) {
+      var p = pedidosAtivos[chave];
+      if (p.resolvido || p.followupEnviado) continue;
+      var decorrido = agora - (p.criadoEm || agora);
+      agendarFollowup(chave, FOLLOWUP_MS - decorrido);
+      reagendados++;
+    }
+    if (reagendados) console.log('🔁 ' + reagendados + ' pedido(s) ativo(s) recarregado(s) com follow-up');
+  } catch(e) {}
+}
+
 // ─── Webhook principal ────────────────────────────────────────
 app.post('/webhook', async function(req, res) {
   res.sendStatus(200);
@@ -104,6 +151,7 @@ app.post('/webhook', async function(req, res) {
           msgGrupo += '👤 Pedido de: ' + pedido.autor;
           await enviarMensagem(pedido.chatId, msgGrupo);
           pedidosAtivos[idMensagem].resolvido = true;
+          salvarPedidosAtivos();
 
         } else if (emoji === '❌') {
           console.log('❌ Fornecedor NÃO tem: ' + pedido.peca + ' ' + pedido.modelo);
@@ -275,8 +323,12 @@ async function processarMensagem(texto, imageUrl, autor, msgId, chatId) {
               fornecedorTelefone: f2.telefone,
               todosFornecedores: fornecedores,
               fornecedorIndex: fornecedores.indexOf(f2),
-              resolvido: false
+              resolvido: false,
+              followupEnviado: false,
+              criadoEm: Date.now()
             };
+            agendarFollowup(msgId2);
+            salvarPedidosAtivos();
           }
         } catch(e) {}
       }
@@ -298,20 +350,12 @@ async function processarMensagem(texto, imageUrl, autor, msgId, chatId) {
           fornecedorTelefone: resultado.fornecedor_telefone,
           todosFornecedores: fornecedores,
           fornecedorIndex: 0,
-          resolvido: false
+          resolvido: false,
+          followupEnviado: false,
+          criadoEm: Date.now()
         };
-
-        // Follow-up 30min
-        setTimeout(async function() {
-          if (pedidosAtivos[novoMsgId] && !pedidosAtivos[novoMsgId].resolvido) {
-            try {
-              await enviarMensagem(resultado.fornecedor_telefone,
-                '⏰ Oi! Ainda aguardamos sobre *' + resultado.tipo_peca + ' ' + resultado.modelo_celular + '*. Tem disponível? Responda 👍 ou ❌');
-              await enviarMensagem(SEU_NUMERO,
-                '⚠️ *' + resultado.fornecedor_nome + '* não respondeu em 30min sobre *' + resultado.tipo_peca + ' ' + resultado.modelo_celular + '*');
-            } catch(e) {}
-          }
-        }, 30 * 60 * 1000);
+        agendarFollowup(novoMsgId);
+        salvarPedidosAtivos();
       }
       console.log('📤 Enviado para: ' + resultado.fornecedor_nome);
     }
@@ -339,6 +383,11 @@ async function processarMensagem(texto, imageUrl, autor, msgId, chatId) {
 
 // ─── Busca próximo fornecedor ─────────────────────────────────
 async function buscarProximoFornecedor(pedido, msgIdAnterior) {
+  // Encerra o pedido do fornecedor anterior (evita follow-up indevido)
+  if (msgIdAnterior && pedidosAtivos[msgIdAnterior]) {
+    pedidosAtivos[msgIdAnterior].resolvido = true;
+    salvarPedidosAtivos();
+  }
   if (!pedido.todosFornecedores) return;
   var idx = (pedido.fornecedorIndex || 0) + 1;
   var proximo = pedido.todosFornecedores[idx];
@@ -354,7 +403,9 @@ async function buscarProximoFornecedor(pedido, msgIdAnterior) {
   var msg = '🔍 Preciso de: *' + pedido.peca + ' ' + pedido.modelo + '*\nQtd: ' + pedido.quantidade + '\nResponda 👍 se TEM ou ❌ se NÃO TEM';
   var novoId = await enviarMensagemRetornaId(proximo.telefone, msg);
   if (novoId) {
-    pedidosAtivos[novoId] = { ...pedido, fornecedor: proximo.nome, fornecedorTelefone: proximo.telefone, fornecedorIndex: idx, resolvido: false };
+    pedidosAtivos[novoId] = { ...pedido, fornecedor: proximo.nome, fornecedorTelefone: proximo.telefone, fornecedorIndex: idx, resolvido: false, followupEnviado: false, criadoEm: Date.now() };
+    agendarFollowup(novoId);
+    salvarPedidosAtivos();
     console.log('🔄 Tentando: ' + proximo.nome);
   }
 }
@@ -386,6 +437,7 @@ async function processarRespostaTextoFornecedor(phone, mensagem, nome) {
 
     var analise = JSON.parse(resp.data.content[0].text.trim().replace(/```json/g,'').replace(/```/g,'').trim());
     pedidosAtivos[chaveEncontrada].resolvido = true;
+    salvarPedidosAtivos();
 
     var msgG = analise.tem
       ? '✅ *' + (nome||'Fornecedor') + ' TEM!*\n📦 ' + pedidoRelacionado.peca + ' ' + pedidoRelacionado.modelo +
@@ -473,8 +525,10 @@ app.listen(PORT, function() {
   console.log('👍❌ Reação fornecedor: SIM');
   console.log('🔄 Próximo fornecedor automático: SIM');
   console.log('⚡ Urgência: SIM');
+  console.log('⏰ Follow-up: 30min (todos os pedidos)');
   console.log('📊 Relatório: 18h');
   console.log('🌐 Painel: http://localhost:' + PORT);
   console.log('\nAguardando mensagens...\n');
+  carregarPedidosAtivos();
   agendarRelatorio();
 });
